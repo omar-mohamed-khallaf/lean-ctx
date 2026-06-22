@@ -120,7 +120,7 @@ OUTPUT STYLE: expert-terse
 - BUDGET: ≤100 tokens per non-code response";
 
 /// Return the compression prompt text for a given level (empty string for Off).
-pub fn compression_text(level: &CompressionLevel) -> &'static str {
+pub fn compression_text(level: CompressionLevel) -> &'static str {
     match level {
         CompressionLevel::Off => "",
         CompressionLevel::Lite => LITE_PROMPT,
@@ -186,7 +186,7 @@ pub fn render(shadow: bool, wrapper: Wrapper, level: CompressionLevel) -> String
     let mut body = profile.join("\n\n");
 
     // Append compression prompt for active levels
-    let compression = compression_text(&level);
+    let compression = compression_text(level);
     if !compression.is_empty() {
         body.push('\n');
         body.push_str(compression);
@@ -516,10 +516,10 @@ mod tests {
 
     #[test]
     fn compression_text_matches_level() {
-        assert!(compression_text(&CompressionLevel::Off).is_empty());
-        assert!(compression_text(&CompressionLevel::Lite).contains("Bullet"));
-        assert!(compression_text(&CompressionLevel::Standard).contains("fn, cfg"));
-        assert!(compression_text(&CompressionLevel::Max).contains("Telegraph"));
+        assert!(compression_text(CompressionLevel::Off).is_empty());
+        assert!(compression_text(CompressionLevel::Lite).contains("Bullet"));
+        assert!(compression_text(CompressionLevel::Standard).contains("fn, cfg"));
+        assert!(compression_text(CompressionLevel::Max).contains("Telegraph"));
     }
 
     // --- Wrapper round-trip ---

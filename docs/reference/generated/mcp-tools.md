@@ -266,14 +266,14 @@ Parameters: `ignore_gitignore`, `max_results`, `path`, `paths`, `pattern`*
 
 ## `ctx_graph`
 
-Code graph queries — find dependencies, relationships, and symbols.
+Graph queries — find dependencies, relationships, and symbols.
 action=symbol path="file.rs::fnName" returns the source (NOT usages).
 action=neighbors path="file.rs" shows import neighbors with direction & confidence.
 action=impact path="file.rs" shows reverse dependency tree (blast radius).
 action=path from→to shows shortest dependency chain between two files.
 action=diff since=HEAD~1 for git change impact.
 action=diagram kind=deps|calls renders a Mermaid diagram.
-For understanding code, use ctx_compose FIRST. Use ctx_graph for targeted structural queries by the graph index.
+For understanding code, use ctx_compose FIRST. Use ctx_graph for targeted structural queries.
 ANTIPATTERN: symbol returns only the DEFINITION — not usages. For REFERENCES use grep or ctx_compose.
 
 Parameters: `action`*, `depth`, `format`, `kind`, `path`, `project_root`, `since`, `to`
