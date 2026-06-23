@@ -463,11 +463,16 @@ pub struct Config {
     /// Override via LEAN_CTX_SANDBOX_LEVEL env var.
     #[serde(default)]
     pub sandbox_level: u8,
-    /// Per-tool handler watchdog timeout in seconds (default: 300).
-    /// Applies to non-shell tools; set to 0 to disable.
-    /// Override via LEAN_CTX_TOOL_TIMEOUT_SECS env var.
+    /// Default shell command timeout in seconds (normal commands, default: 600 = 10 min).
+    /// Override via LEAN_CTX_SHELL_TIMEOUT_SECS env var.
+    /// For heavy commands (builds, tests), see shell_heavy_timeout_secs.
+    /// LEAN_CTX_SHELL_TIMEOUT_MS overrides both normal and heavy timeouts.
     #[serde(default)]
-    pub tool_timeout_secs: Option<u64>,
+    pub shell_timeout_secs: Option<u64>,
+    /// Shell command timeout in seconds for heavy commands (cargo build, make, etc., default: 3600 = 1 hr).
+    /// Override via LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS env var.
+    #[serde(default)]
+    pub shell_heavy_timeout_secs: Option<u64>,
     /// When true, large tool outputs (>4000 chars) are stored as references
     /// and a short URI is returned instead of the full content.
     /// Override via LEAN_CTX_REFERENCE_RESULTS env var.
@@ -504,6 +509,15 @@ pub struct Config {
     /// LEAN_CTX_SHELL_SECURITY. `None` resolves to `enforce`.
     #[serde(default)]
     pub shell_security: Option<String>,
+
+    /// When true, ctx_shell accepts shell file-write redirects (`>`, `>>`, `tee`,
+    /// heredoc-to-file, curl -o, wget default mode). Default false — use the
+    /// native Write/Edit tool instead. Enable for power users who prefer classic
+    /// shell syntax over the MCP write tool. Compression stays active when
+    /// enabled. Override via LEAN_CTX_SHELL_ALLOW_WRITES=1.
+    #[serde(default)]
+    pub shell_allow_writes: bool,
+
     /// Setup behavior: controls what gets injected during setup and updates.
     #[serde(default)]
     pub setup: SetupConfig,
@@ -603,13 +617,15 @@ impl Default for Config {
             allow_auto_reroot: false,
             path_jail: None,
             sandbox_level: 0,
-            tool_timeout_secs: None,
+            shell_timeout_secs: None,
+            shell_heavy_timeout_secs: None,
             reference_results: false,
             agent_token_budget: 0,
             shell_allowlist: default_shell_allowlist(),
             shell_allowlist_extra: Vec::new(),
             shell_strict_mode: false,
             shell_security: None,
+            shell_allow_writes: false,
             setup: SetupConfig::default(),
         }
     }
@@ -928,6 +944,18 @@ impl Config {
     /// Returns `true` if shell hook injection is disabled via env var or config.
     pub fn shell_hook_disabled_effective(&self) -> bool {
         std::env::var("LEAN_CTX_NO_HOOK").is_ok() || self.shell_hook_disabled
+    }
+
+    /// Returns `true` if ctx_shell may accept shell file-write redirects.
+    /// `LEAN_CTX_SHELL_ALLOW_WRITES` env var overrides config.toml.
+    pub fn shell_allow_writes_effective(&self) -> bool {
+        match std::env::var("LEAN_CTX_SHELL_ALLOW_WRITES") {
+            Ok(raw) => matches!(
+                raw.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => self.shell_allow_writes,
+        }
     }
 
     /// Returns the effective shell activation mode (env var > config > default).

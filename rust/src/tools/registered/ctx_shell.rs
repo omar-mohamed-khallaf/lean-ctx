@@ -42,9 +42,10 @@ impl McpTool for CtxShellTool {
         let command = get_str(args, "command")
             .ok_or_else(|| ErrorData::invalid_params("command is required", None))?;
 
-        if let Some(rejection) = crate::tools::ctx_shell::validate_command(&command) {
-            // The command never ran — report as a tool error so MCP clients
-            // (guards, retry logic) can detect it programmatically (#389).
+        let allow_writes = crate::core::config::Config::load().shell_allow_writes_effective();
+        if !allow_writes
+            && let Some(rejection) = crate::tools::ctx_shell::validate_command(&command)
+        {
             return Ok(ToolOutput {
                 shell_outcome: Some(ShellOutcome::Blocked),
                 ..ToolOutput::simple(rejection)

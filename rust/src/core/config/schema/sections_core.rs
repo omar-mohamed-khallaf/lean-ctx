@@ -541,12 +541,21 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         ),
     );
     root.insert(
-        "tool_timeout_secs".into(),
+        "shell_timeout_secs".into(),
         key_with_env(
             "u64?",
             serde_json::json!(null),
-            "Per-tool handler watchdog timeout in seconds (default: 300). Applies to non-shell tools; 0 disables",
-            "LEAN_CTX_TOOL_TIMEOUT_SECS",
+            "Default shell command timeout in seconds for normal commands (default: 600 = 10 min)",
+            "LEAN_CTX_SHELL_TIMEOUT_SECS",
+        ),
+    );
+    root.insert(
+        "shell_heavy_timeout_secs".into(),
+        key_with_env(
+            "u64?",
+            serde_json::json!(null),
+            "Shell command timeout in seconds for heavy commands (cargo build, make, etc., default: 3600 = 1 hr)",
+            "LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS",
         ),
     );
     root.insert(
@@ -598,6 +607,17 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             serde_json::json!("enforce"),
             "Shell command gating: enforce (default, secure), warn (log only, never block) or off (skip allowlist + hard blocks; compression stays active)",
             "LEAN_CTX_SHELL_SECURITY",
+        ),
+    );
+    root.insert(
+        "shell_allow_writes".into(),
+        key_with_env(
+            "bool",
+            serde_json::json!(false),
+            "Allow ctx_shell file-write redirects (>, >>, tee, heredoc-to-file, curl -o, wget default mode). \
+             Default false — use the native Write/Edit tool. Enable for power users who prefer shell syntax. \
+             Override via LEAN_CTX_SHELL_ALLOW_WRITES=1",
+            "LEAN_CTX_SHELL_ALLOW_WRITES",
         ),
     );
 

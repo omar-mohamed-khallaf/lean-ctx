@@ -1362,6 +1362,76 @@ mod setup_config_tests {
 }
 
 #[cfg(test)]
+mod shell_allow_writes_tests {
+    use super::super::*;
+
+    #[test]
+    fn default_is_false() {
+        let cfg = Config::default();
+        assert!(!cfg.shell_allow_writes);
+    }
+
+    #[test]
+    fn effective_false_when_unset() {
+        if std::env::var("LEAN_CTX_SHELL_ALLOW_WRITES").is_ok() {
+            return;
+        }
+        let cfg = Config::default();
+        assert!(!cfg.shell_allow_writes_effective());
+    }
+
+    #[test]
+    fn config_field_true_respected() {
+        if std::env::var("LEAN_CTX_SHELL_ALLOW_WRITES").is_ok() {
+            return;
+        }
+        let cfg = Config {
+            shell_allow_writes: true,
+            ..Default::default()
+        };
+        assert!(cfg.shell_allow_writes_effective());
+    }
+
+    #[test]
+    fn deserialization_from_toml() {
+        let cfg: Config = toml::from_str("shell_allow_writes = true").unwrap();
+        assert!(cfg.shell_allow_writes);
+    }
+
+    #[test]
+    fn deserialization_absent_defaults_false() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.shell_allow_writes);
+    }
+
+    #[test]
+    fn independent_of_shell_strict_mode() {
+        let cfg = Config {
+            shell_allow_writes: true,
+            shell_strict_mode: true,
+            ..Default::default()
+        };
+        assert!(cfg.shell_allow_writes);
+        assert!(cfg.shell_strict_mode);
+    }
+
+    #[test]
+    fn round_trip_preserves_field() {
+        let cfg = Config {
+            shell_allow_writes: true,
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&cfg).expect("Config must serialize to TOML");
+        let restored: Config =
+            toml::from_str(&serialized).expect("serialized Config must round-trip");
+        assert!(
+            restored.shell_allow_writes,
+            "shell_allow_writes must survive a TOML serialize → deserialize round-trip"
+        );
+    }
+}
+
+#[cfg(test)]
 mod config_load_cache_tests {
     use super::super::*;
     use crate::core::data_dir::isolated_data_dir;

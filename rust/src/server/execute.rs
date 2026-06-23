@@ -3,7 +3,6 @@ use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 const READER_RESULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
@@ -181,46 +180,61 @@ fn ensure_utf8_locale(
 }
 
 fn command_timeout(command: &str) -> Duration {
-    // Explicit env override always wins (operators can pin any value).
-    if let Some(ms) = std::env::var("LEAN_CTX_SHELL_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-    {
-        return Duration::from_millis(ms);
-    }
-    // Otherwise mirror the interactive shell-hook path: heavy builds/tests
-    // (cargo install/nextest/build, npm ci, …) get the long timeout instead of
-    // being killed at the 2-minute default. Keeps `ctx_shell` and the hook
-    // consistent — previously only the hook consulted `is_heavy_command`.
-    crate::shell::heavy_timeout(command).unwrap_or(DEFAULT_COMMAND_TIMEOUT)
+    crate::shell::shell_timeout(command)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_COMMAND_TIMEOUT, command_timeout, ensure_utf8_locale, execute_command_in};
+    use super::{command_timeout, ensure_utf8_locale, execute_command_in};
 
     #[test]
     fn command_timeout_uses_heavy_for_heavy_commands() {
-        let saved = std::env::var("LEAN_CTX_SHELL_TIMEOUT_MS").ok();
+        let saved_ms = std::env::var("LEAN_CTX_SHELL_TIMEOUT_MS").ok();
+        let saved_secs = std::env::var("LEAN_CTX_SHELL_TIMEOUT_SECS").ok();
+        let saved_heavy = std::env::var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS").ok();
         crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_MS");
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_SECS");
+        crate::test_env::remove_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS");
 
-        // Heavy build/test commands get the long timeout, not the 2-min default.
-        assert!(command_timeout("cargo install --path .") > DEFAULT_COMMAND_TIMEOUT);
-        assert!(command_timeout("cargo nextest run") > DEFAULT_COMMAND_TIMEOUT);
-        // Ordinary commands keep the default.
-        assert_eq!(command_timeout("git status"), DEFAULT_COMMAND_TIMEOUT);
+        let heavy = command_timeout("cargo install --path .");
+        let normal = command_timeout("git status");
+        assert!(
+            heavy > normal,
+            "heavy timeout ({heavy:?}) should exceed normal ({normal:?})"
+        );
 
-        // Explicit env override wins over heavy detection.
+        // LEAN_CTX_SHELL_TIMEOUT_MS still wins over everything.
         crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", "5000");
         assert_eq!(
             command_timeout("cargo install --path ."),
             std::time::Duration::from_secs(5)
         );
-
         crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_MS");
-        if let Some(v) = saved {
+
+        // LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS overrides heavy timeout.
+        crate::test_env::set_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS", "120");
+        assert_eq!(
+            command_timeout("cargo install --path ."),
+            std::time::Duration::from_secs(120)
+        );
+        crate::test_env::remove_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS");
+
+        // LEAN_CTX_SHELL_TIMEOUT_SECS overrides normal timeout.
+        crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_SECS", "30");
+        assert_eq!(
+            command_timeout("git status"),
+            std::time::Duration::from_secs(30)
+        );
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_SECS");
+
+        if let Some(v) = saved_ms {
             crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", v);
+        }
+        if let Some(v) = saved_secs {
+            crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_SECS", v);
+        }
+        if let Some(v) = saved_heavy {
+            crate::test_env::set_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS", v);
         }
     }
 

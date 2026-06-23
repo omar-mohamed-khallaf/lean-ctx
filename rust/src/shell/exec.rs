@@ -101,15 +101,63 @@ fn wait_with_limits(mut child: Child, max_bytes: usize, timeout: std::time::Dura
 }
 
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+pub(crate) const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600); // 10 min
 const HEAVY_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MB
-const HEAVY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+pub(crate) const HEAVY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600); // 1 hr
+
+/// Resolve the shell command timeout, checking env overrides and config before
+/// falling back to the hardcoded constants (DEFAULT_TIMEOUT / HEAVY_TIMEOUT).
+///
+/// Priority:
+///  1. `LEAN_CTX_SHELL_TIMEOUT_MS` — universal override (already existed, wins everything)
+///  2. `LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS` / config `shell_heavy_timeout_secs` — heavy only
+///  3. `LEAN_CTX_SHELL_TIMEOUT_SECS` / config `shell_timeout_secs` — normal only
+///  4. Hardcoded DEFAULT_TIMEOUT / HEAVY_TIMEOUT
+pub fn shell_timeout(command: &str) -> std::time::Duration {
+    // #1 Universal override (exists before this change)
+    if let Some(ms) = std::env::var("LEAN_CTX_SHELL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+
+    if is_heavy_command(command) {
+        // #2 Heavy-specific
+        if let Some(secs) = std::env::var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+        {
+            return std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = config::Config::load().shell_heavy_timeout_secs {
+            return std::time::Duration::from_secs(secs);
+        }
+        HEAVY_TIMEOUT
+    } else {
+        // #3 Normal-specific
+        if let Some(secs) = std::env::var("LEAN_CTX_SHELL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+        {
+            return std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = config::Config::load().shell_timeout_secs {
+            return std::time::Duration::from_secs(secs);
+        }
+        DEFAULT_TIMEOUT
+    }
+}
 
 fn exec_limits(command: &str) -> (usize, std::time::Duration) {
+    let timeout = shell_timeout(command);
     if is_heavy_command(command) {
-        (HEAVY_MAX_BYTES, HEAVY_TIMEOUT)
+        (HEAVY_MAX_BYTES, timeout)
     } else {
-        (DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT)
+        (DEFAULT_MAX_BYTES, timeout)
     }
 }
 
@@ -157,16 +205,6 @@ fn is_heavy_command(command: &str) -> bool {
         "mix compile",
     ];
     HEAVY_PREFIXES.iter().any(|p| lower.starts_with(p))
-}
-
-/// Timeout the MCP `ctx_shell` tool should grant a command, mirroring the
-/// interactive hook's heavy-command detection. Returns `None` for ordinary
-/// commands (caller applies its own default), `Some(HEAVY_TIMEOUT)` for heavy
-/// builds/tests so long-running `cargo install`/`nextest`/etc. aren't killed at
-/// the 2-minute default. Keeps the MCP path and the shell-hook path consistent.
-#[must_use]
-pub(crate) fn heavy_timeout(command: &str) -> Option<std::time::Duration> {
-    is_heavy_command(command).then_some(HEAVY_TIMEOUT)
 }
 
 /// Execute a command from pre-split argv without going through `sh -c`.
@@ -776,17 +814,56 @@ mod exec_tests {
     }
 
     #[test]
-    fn heavy_timeout_some_for_heavy_none_otherwise() {
+    fn shell_timeout_heavy_exceeds_normal() {
+        let saved_ms = std::env::var("LEAN_CTX_SHELL_TIMEOUT_MS").ok();
+        let saved_heavy = std::env::var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS").ok();
+        let saved_normal = std::env::var("LEAN_CTX_SHELL_TIMEOUT_SECS").ok();
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_MS");
+        crate::test_env::remove_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS");
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_SECS");
+
+        assert!(
+            super::shell_timeout("cargo build --release") > super::shell_timeout("echo hello"),
+            "heavy timeout must exceed normal timeout"
+        );
+
+        // LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS overrides heavy.
+        crate::test_env::set_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS", "120");
         assert_eq!(
-            super::heavy_timeout("cargo install --path ."),
-            Some(super::HEAVY_TIMEOUT)
+            super::shell_timeout("cargo build"),
+            std::time::Duration::from_secs(120)
+        );
+        crate::test_env::remove_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS");
+
+        // LEAN_CTX_SHELL_TIMEOUT_SECS overrides normal.
+        crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_SECS", "30");
+        assert_eq!(
+            super::shell_timeout("git status"),
+            std::time::Duration::from_secs(30)
+        );
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_SECS");
+
+        // LEAN_CTX_SHELL_TIMEOUT_MS universal override wins.
+        crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", "5000");
+        assert_eq!(
+            super::shell_timeout("cargo build"),
+            std::time::Duration::from_secs(5)
         );
         assert_eq!(
-            super::heavy_timeout("cargo nextest run"),
-            Some(super::HEAVY_TIMEOUT)
+            super::shell_timeout("git status"),
+            std::time::Duration::from_secs(5)
         );
-        assert_eq!(super::heavy_timeout("git status"), None);
-        assert_eq!(super::heavy_timeout("ls -la"), None);
+        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_MS");
+
+        if let Some(v) = saved_ms {
+            crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", v);
+        }
+        if let Some(v) = saved_heavy {
+            crate::test_env::set_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS", v);
+        }
+        if let Some(v) = saved_normal {
+            crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_SECS", v);
+        }
     }
 
     // P0-1 (#413): the CLI allowlist must enforce for agents, warn for humans.

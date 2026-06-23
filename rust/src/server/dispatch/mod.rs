@@ -490,41 +490,19 @@ impl LeanCtxServer {
     /// Watchdog deadline for a single tool handler, or `None` to disable it.
     ///
     /// `ctx_shell` / `ctx_execute` run arbitrary user commands (builds, long
-    /// test suites) and already enforce their own command timeouts, so a generic
-    /// watchdog would wrongly abort a legitimate long-running command. Every
-    /// other tool is bounded so a hang can never swallow the JSON-RPC response.
-    /// Tunable via `LEAN_CTX_TOOL_TIMEOUT_SECS` (`0` disables the watchdog).
+    /// test suites) and already enforce their own command timeouts from
+    /// [`crate::shell::shell_timeout`], so a generic watchdog would wrongly
+    /// abort a legitimate long-running command. Every other tool is bounded so
+    /// a hang can never swallow the JSON-RPC response.
     fn handler_watchdog(name: &str) -> Option<Duration> {
         if super::is_shell_tool_name(name) {
             return None;
         }
-        watchdog_from_secs(read_watchdog_secs())
+        Some(Duration::from_secs(300))
     }
 }
 
-/// Read the configured watchdog budget in seconds (defaults to
-/// [`DEFAULT_TOOL_TIMEOUT_SECS`]). Priority: env var > config.toml > default.
-/// Kept separate from the policy so the pure `secs -> Option<Duration>` mapping
-/// stays trivially testable.
-fn read_watchdog_secs() -> u64 {
-    std::env::var("LEAN_CTX_TOOL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| crate::core::config::Config::load().tool_timeout_secs)
-        .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
-}
-
-/// Map a watchdog budget in seconds to a duration; `0` disables the watchdog.
-fn watchdog_from_secs(secs: u64) -> Option<Duration> {
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
-
 const REFERENCE_THRESHOLD: usize = 4000;
-
-/// Default per-tool watchdog budget (#271). Long enough that no legitimate
-/// read/search/graph call ever hits it, short enough that a hang degrades to a
-/// clean error instead of a dropped request.
-const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 
 const PATH_LIKE_KEYS: &[&str] = &[
     "path",
@@ -591,18 +569,15 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_from_secs_zero_disables() {
-        assert!(watchdog_from_secs(0).is_none());
-    }
-
-    #[test]
-    fn watchdog_from_secs_positive_maps_to_duration() {
-        assert_eq!(watchdog_from_secs(5).unwrap().as_secs(), 5);
+    fn watchdog_handlers_non_shell_tools() {
+        // Non-shell tools get the hardcoded 300s watchdog.
         assert_eq!(
-            watchdog_from_secs(DEFAULT_TOOL_TIMEOUT_SECS)
-                .unwrap()
-                .as_secs(),
-            300
+            LeanCtxServer::handler_watchdog("ctx_read"),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            LeanCtxServer::handler_watchdog("ctx_search"),
+            Some(Duration::from_secs(300))
         );
     }
 
