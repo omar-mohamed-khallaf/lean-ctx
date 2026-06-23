@@ -203,6 +203,14 @@ fn is_heavy_command(command: &str) -> bool {
         "uv sync",
         "bundle install",
         "mix compile",
+        // Git commands that fire build/test hooks: a `pre-commit` running
+        // `cargo clippy` or a `pre-push` running a full preflight can take
+        // minutes, far past the 2-minute default. Killing git mid-hook leaves
+        // the working tree staged-but-uncommitted and the push half-done, so
+        // these get the heavy ceiling. `git status`/`log`/`diff` stay default
+        // because the prefix is the full `git <verb>`.
+        "git commit",
+        "git push",
     ];
     HEAVY_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
@@ -800,6 +808,16 @@ mod exec_tests {
         let (bytes, timeout) = super::exec_limits("docker build -t myapp .");
         assert_eq!(bytes, super::HEAVY_MAX_BYTES);
         assert_eq!(timeout, super::HEAVY_TIMEOUT);
+
+        // Git commands that trigger build/test hooks (pre-commit clippy,
+        // pre-push preflight) must not be killed at the 2-minute default.
+        let (bytes, timeout) = super::exec_limits("git commit --amend --no-edit");
+        assert_eq!(bytes, super::HEAVY_MAX_BYTES);
+        assert_eq!(timeout, super::HEAVY_TIMEOUT);
+
+        let (bytes, timeout) = super::exec_limits("git push -u origin HEAD");
+        assert_eq!(bytes, super::HEAVY_MAX_BYTES);
+        assert_eq!(timeout, super::HEAVY_TIMEOUT);
     }
 
     #[test]
@@ -808,7 +826,13 @@ mod exec_tests {
         assert_eq!(bytes, super::DEFAULT_MAX_BYTES);
         assert_eq!(timeout, super::DEFAULT_TIMEOUT);
 
+        // Read-only git verbs stay on the default ceiling — only `commit`/`push`
+        // (which fire the cargo-heavy hooks) are promoted.
         let (bytes, timeout) = super::exec_limits("git status");
+        assert_eq!(bytes, super::DEFAULT_MAX_BYTES);
+        assert_eq!(timeout, super::DEFAULT_TIMEOUT);
+
+        let (bytes, timeout) = super::exec_limits("git log --oneline -5");
         assert_eq!(bytes, super::DEFAULT_MAX_BYTES);
         assert_eq!(timeout, super::DEFAULT_TIMEOUT);
     }
@@ -853,17 +877,16 @@ mod exec_tests {
             super::shell_timeout("git status"),
             std::time::Duration::from_secs(5)
         );
-        crate::test_env::remove_var("LEAN_CTX_SHELL_TIMEOUT_MS");
-
-        if let Some(v) = saved_ms {
-            crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_MS", v);
-        }
-        if let Some(v) = saved_heavy {
-            crate::test_env::set_var("LEAN_CTX_SHELL_HEAVY_TIMEOUT_SECS", v);
-        }
-        if let Some(v) = saved_normal {
-            crate::test_env::set_var("LEAN_CTX_SHELL_TIMEOUT_SECS", v);
-        }
+        assert_eq!(
+            super::heavy_timeout("git commit -m 'wip'"),
+            Some(super::HEAVY_TIMEOUT)
+        );
+        assert_eq!(
+            super::heavy_timeout("git push origin main"),
+            Some(super::HEAVY_TIMEOUT)
+        );
+        assert_eq!(super::heavy_timeout("git status"), None);
+        assert_eq!(super::heavy_timeout("ls -la"), None);
     }
 
     // P0-1 (#413): the CLI allowlist must enforce for agents, warn for humans.

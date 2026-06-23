@@ -6,6 +6,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Repo-stack-aware profile recommendation — `lean-ctx profile suggest` (#851).**
+  Scans the current repo for deterministic, local signals (languages + source-file
+  count, monorepo layout via `pathutil::has_multi_repo_children` + workspace
+  markers, build/CI markers, configured LLM providers) and recommends a context
+  profile plus key settings (`profile`, `output_density`, `proxy.history_mode`;
+  `proxy.effort` is left off — it is never inferred from a repo). Prints the exact
+  `export` / `config set` commands to apply it, plus task-oriented alternatives
+  (`ci-debug` first when CI is detected, then `hotfix`/`bugfix`/`review`). Strictly
+  **read-only** — it never writes config. `--json` for scripting. The mapping
+  (`core::profile_suggest::suggest`) is a pure, unit-tested function separated from
+  the gitignore-aware scan, so the suggestion is a deterministic function of the
+  repo + environment (no network, no telemetry).
+- **Review-before-overwrite for consequential CLI writes (#852).** State-mutating
+  writes that could clobber existing state now print a before→after diff plus a
+  risk note and require confirmation (or `--yes`) — mirroring the `yolo` / `secure`
+  pattern, and refusing to run non-interactively without `--yes`. Covers
+  `lean-ctx config set` for security/egress-relevant keys (`path_jail`,
+  `shell_security`, `sandbox_level`, `secret_detection.*`, `boundary_policy`,
+  `proxy.*_upstream`) and `lean-ctx knowledge remember` when it would overwrite an
+  existing fact with a materially different value (the prior value is archived).
+  The knowledge gate reuses the exact overwrite predicate the write path applies
+  (`check_contradiction`), so additive, identical, near-identical (>0.8 similarity)
+  and no-op writes stay frictionless. The shared prompt/confirm helper is now a
+  single `cli::prompt` module (extracted from `security_cmd`), and config-key risk
+  classification lives in `core::config::risk` — deterministic and local-only. The
+  MCP `ctx_knowledge` tool path is unchanged (agent writes stay versioned and
+  contradiction-warned without an interactive gate).
+- **Tool & rule budget — `lean-ctx tools health` (#848).** A deterministic,
+  local-only "rot" report answering whether every always-on token earns its
+  place. Cross-references the *fixed cost* of each advertised MCP tool schema,
+  the MCP instructions, and every auto-loaded rules file with *recorded usage*
+  (the post-dispatch cost ledger) to flag: tools that cost schema tokens every
+  session but are never called (`unused`), heavy-schema tools used for <1% of
+  calls (`low-use`), rules files that bill the same guidance to a client more
+  than once, and stale knowledge facts (>30d, never retrieved). Reuses existing
+  telemetry and adds **no** new hot-path cost — per-tool `last_used` rides the
+  cost-attribution write that already happens. Text (rot candidates only; `--all`
+  for the full list), `--json` for scripting, and a **Tool Budget** panel in the
+  dashboard health view (`/api/tools-health`). Never auto-applies: every finding
+  is a suggestion (`lean-ctx tools lean`, `lean-ctx rules dedup --apply`).
 - **Cache-safe cross-provider reasoning-effort control — `proxy.effort` (#834).**
   One opt-in setting (`off` | `minimal` | `low` | `medium` | `high`) pins a single
   reasoning-effort level across **all three providers** without breaking the provider
@@ -154,6 +194,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   can opt in via `LEAN_CTX_TRUST_WORKSPACE=1` or `LEAN_CTX_TRUSTED_ROOTS`.
 
 ### Changed
+- **Change-aware pre-push gate + no-test advisory (#850/#849).** `scripts/preflight.sh`
+  now classifies the diff against `origin/main`: a docs-only push (README, CHANGELOG,
+  `*.md`, website, scripts) skips the Rust gates (fmt/clippy/rustdoc/Windows
+  cross-compile) and the pre-push hook finishes in ~0.1 s instead of ~140 s.
+  `gen_docs --check` still runs whenever Rust **or** a committed file under
+  `docs/reference/generated/**` changed. CI is unchanged and remains the source of
+  truth (a docs-only diff cannot turn a Rust gate red, so the local skip can never
+  cause a local-green / CI-red split); `make preflight` forces the full gate. A change
+  to contract code (`proxy/`, `tools/`, `config/schema/`) with no test signal in the
+  diff prints a no-test advisory — blocking under `LEAN_CTX_PREFLIGHT_STRICT_TESTS=1`.
 - **Faster semantic search on a native ONNX Runtime (#497).** The
   embedding/index stack moves from the pure-Rust `rten` backend to native `ort`
   (ONNX Runtime 2.0), with a rebuilt indexing pipeline (int8-quantized vectors,
@@ -177,6 +227,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `raw` and state that the allowlist still holds.
 
 ### Fixed
+- **`config set` now accepts every valid `Option` config key (`persona`,
+  `bypass_hints`) instead of rejecting them as "Unknown config key" (#856).**
+  `config set` resolves keys via the hand-written schema (`ConfigSchema::lookup`)
+  only. An `Option<_>` scalar field defaults to `None`, so serde omits it from
+  `Config::default()` and it never appears in `config_derived_keys()` (which feeds
+  only `config validate`/`apply`). Any such field that wasn't hand-registered was
+  therefore accepted from `config.toml` but rejected by `config set` and flagged
+  "unknown" by `config validate` — the class behind the `path_jail` report (fixed
+  earlier in #507). Auditing all 17 root-level `Option` fields found two more:
+  `persona` and `bypass_hints` are now registered in the root schema (`persona`
+  as an open `string` so custom `<name>.toml` personas stay valid; `bypass_hints`
+  as `enum(on|off|aggressive)` so `config set` validates the value). A new
+  regression test (`option_scalar_keys_are_cli_settable`) asserts the
+  `Option`-scalar knobs resolve via schema lookup, guarding the whole class.
+- **`lean-ctx -c` no longer kills hook-running `git commit`/`git push` at the
+  2-minute default (#854).** The shell wrapper enforces `DEFAULT_TIMEOUT` (2 min)
+  on ordinary commands and `HEAVY_TIMEOUT` (10 min) on build/test commands, but
+  `git commit`/`git push` were treated as ordinary — even though, in a repo with
+  hooks, `git commit` fans out into `cargo clippy` (pre-commit) and `git push`
+  into the full `scripts/preflight.sh` (pre-push), each of which routinely runs
+  3–10 min. The wrapper SIGKILLed git mid-hook, leaving the tree
+  staged-but-uncommitted or the push half-done. `is_heavy_command` now classifies
+  `git commit` and `git push` as heavy (10-min ceiling, 32 MB buffer); read-only
+  verbs (`git status`/`log`/`diff`) stay on the default ceiling because matching
+  is on the full `git <verb>` prefix.
 - **Hybrid/dense cold-start no longer re-embeds the whole corpus inline (#512).**
   On a large repo, the *first* `ctx_semantic_search mode=hybrid` (or `dense`) call on
   an MCP server that started *before* the on-disk dense index existed would embed the

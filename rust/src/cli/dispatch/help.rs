@@ -64,6 +64,8 @@ EVERYDAY COMMANDS:
     lean-ctx dashboard             Open the web dashboard (localhost:3333)
     lean-ctx tools <profile>       Choose how many MCP tools your agent sees
                                    (minimal · standard · power)
+    lean-ctx tools health          Token-budget & rot report (unused tools,
+                                   duplicate rules, stale knowledge)
 
 MANAGE:
     lean-ctx status                Am I connected? (quick check)
@@ -200,11 +202,12 @@ COMMANDS:
     security secrets <on|off>      Toggle secret/.env redaction (separate from containment)
     allow <cmd>                    Allow one shell command (additive; granular re-enable after yolo)
     tools [minimal|standard|power|show|list]  How many MCP tools your agent sees
-    profile [list|show|diff|create|set]  Manage context profiles (compression/read modes)
+    profile [list|show|diff|create|set|suggest]  Manage context profiles (suggest = recommend from repo)
     theme [list|set|export|import] Customize terminal colors and themes
     tee [list|clear|show <file>|last] Manage output tee files (~/.lean-ctx/tee/)
     compression [off|lite|standard|max]  Set compression level (saves 25-65% tokens; alias: terse)
     slow-log [list|clear]          Show/clear slow command log (~/.lean-ctx/slow-commands.log)
+    debug-log [list|tail N|clear|path]  Opt-in tool-call + hook-routing log (set debug_log / LEAN_CTX_DEBUG_LOG)
     update [<version>] [--check]   Update lean-ctx, or pin a version, from GitHub Releases
     stop                           Stop ALL lean-ctx processes (daemon, proxy, orphans)
     restart                        Restart daemon (applies config.toml changes)
