@@ -3,11 +3,15 @@
 //! `use super::*` re-imports the parent module’s types and helpers.
 
 #[allow(clippy::wildcard_imports)]
-use super::*;
+use std::sync::Arc;
+
+use rayon::prelude::*;
+
+use super::{HashMap, IndexEdge, Path, ProjectIndex, import_resolver, normalize_project_root};
 
 pub(crate) fn build_edges_cached(
     index: &mut ProjectIndex,
-    content_cache: &HashMap<String, String>,
+    content_cache: &HashMap<String, Arc<String>>,
 ) {
     // Co-change history is a single `git log` subprocess that is I/O bound on the
     // git object store, whereas the import/deep-analysis pass below is CPU bound.
@@ -22,7 +26,7 @@ pub(crate) fn build_edges_cached(
     build_sibling_edges(index);
 }
 
-fn build_edges_with_cache(index: &mut ProjectIndex, content_cache: &HashMap<String, String>) {
+fn build_edges_with_cache(index: &mut ProjectIndex, content_cache: &HashMap<String, Arc<String>>) {
     index.edges.clear();
 
     if crate::core::memory_guard::abort_requested() {
@@ -39,72 +43,87 @@ fn build_edges_with_cache(index: &mut ProjectIndex, content_cache: &HashMap<Stri
     let resolver_ctx =
         import_resolver::ResolverContext::new(root_path, file_paths.clone(), content_cache);
 
-    // #934: the per-file deep analysis (a second tree-sitter parse) dominates the
-    // edge-build cost and is pure + thread-safe (thread_local parser, read-only
-    // resolver context). Fan it out, collecting in file order; the sequential
-    // branch keeps the memory-pressure early-break. Edges are sorted + deduped
-    // below, so per-file insertion order never affects the result.
-    let per_file: Vec<FileEdges> = if crate::core::memory_guard::is_under_pressure() {
-        let mut acc = Vec::with_capacity(file_paths.len());
-        for (i, rel_path) in file_paths.iter().enumerate() {
-            if i.is_multiple_of(1000) && crate::core::memory_guard::is_under_pressure() {
-                tracing::warn!(
-                    "[graph_index: stopping edge-building at file {i}/{} due to memory pressure]",
-                    file_paths.len()
-                );
-                break;
+    const MAX_FILE_SIZE_FOR_EDGES: u64 = 2 * 1024 * 1024;
+
+    // Each file's import resolution is independent — parallelise the outer
+    // loop with rayon.  Per-file results are flat-merged and deduplicated.
+    let import_edges: Vec<IndexEdge> = file_paths
+        .par_iter()
+        .flat_map(|rel_path| {
+            let content = if let Some(cached) = content_cache.get(rel_path) {
+                std::borrow::Cow::Borrowed(cached.as_str())
+            } else {
+                let abs_path = root_path.join(rel_path.trim_start_matches(['/', '\\']));
+                if let Ok(meta) = abs_path.metadata()
+                    && meta.len() > MAX_FILE_SIZE_FOR_EDGES
+                {
+                    return Vec::new();
+                }
+                match std::fs::read_to_string(&abs_path) {
+                    Ok(c) => std::borrow::Cow::Owned(c),
+                    Err(_) => return Vec::new(),
+                }
+            };
+
+            let ext = Path::new(rel_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+
+            // Godot scenes carry their dependencies in `[ext_resource]` headers
+            let (resolve_ext, imports) = if ext == "tscn" {
+                (
+                    "tscn",
+                    crate::core::godot::scene::extract_scene_imports(&content),
+                )
+            } else {
+                let resolve_ext = match ext {
+                    "vue" | "svelte" => "ts",
+                    _ => ext,
+                };
+
+                let analysis_content = if ext == "vue" || ext == "svelte" {
+                    if let Some(script) =
+                        crate::core::signatures_ts::sfc::extract_script_block(&content)
+                    {
+                        std::borrow::Cow::Owned(script)
+                    } else {
+                        content
+                    }
+                } else {
+                    content
+                };
+
+                let imports =
+                    crate::core::deep_queries::analyze(&analysis_content, resolve_ext).imports;
+                (resolve_ext, imports)
+            };
+
+            if imports.is_empty() {
+                return Vec::new();
             }
-            acc.push(resolve_file_edges(
-                rel_path,
-                content_cache,
-                &resolver_ctx,
-                root_path,
-            ));
-        }
-        acc
-    } else {
-        file_paths
-            .par_iter()
-            .map(|rel_path| resolve_file_edges(rel_path, content_cache, &resolver_ctx, root_path))
-            .collect()
-    };
 
-    // Full analyses of C#/Java/Go/Kotlin files, kept to derive cross-file
-    // type_ref edges after the import pass (GH #398). Those languages resolve
-    // same-namespace/package types without an import, so the import list alone
-    // is not enough.
-    let mut type_inputs: Vec<(String, String, crate::core::deep_queries::DeepAnalysis)> =
-        Vec::new();
-    for fe in per_file {
-        index.edges.extend(fe.edges);
-        if let Some(ti) = fe.type_input {
-            type_inputs.push(ti);
-        }
-    }
-
-    // Cross-file type-reference edges for C#/Java same-namespace usage (GH #398).
-    // Emitted in the durable graph_index -> PropertyGraph mirror so a background
-    // reindex preserves the impact blast radius instead of clearing it; shares
-    // its resolution with the `ctx_impact` builder via `type_ref_edges`.
-    let type_ref_inputs: Vec<crate::core::type_ref_edges::FileAnalysis> = type_inputs
-        .iter()
-        .map(
-            |(path, file_ext, analysis)| crate::core::type_ref_edges::FileAnalysis {
-                path,
-                ext: file_ext,
-                analysis,
-            },
-        )
+            let resolved =
+                import_resolver::resolve_imports(&imports, rel_path, resolve_ext, &resolver_ctx);
+            let mut file_edges: Vec<IndexEdge> = Vec::new();
+            for r in resolved {
+                if r.is_external {
+                    continue;
+                }
+                if let Some(to) = r.resolved_path {
+                    file_edges.push(IndexEdge {
+                        from: rel_path.clone(),
+                        to,
+                        kind: "import".to_string(),
+                        weight: 1.0,
+                    });
+                }
+            }
+            file_edges
+        })
         .collect();
-    for (from, to) in crate::core::type_ref_edges::cross_file_type_edges(&type_ref_inputs) {
-        index.edges.push(IndexEdge {
-            from,
-            to,
-            kind: "type_ref".to_string(),
-            weight: 0.5,
-        });
-    }
 
+    index.edges.extend(import_edges);
     index.edges.sort_by(|a, b| {
         a.from
             .cmp(&b.from)
@@ -224,43 +243,142 @@ fn resolve_file_edges(
 
 fn build_implicit_edges_with_cache(
     index: &mut ProjectIndex,
-    content_cache: &HashMap<String, String>,
+    content_cache: &HashMap<String, Arc<String>>,
 ) {
     let file_paths: Vec<String> = index.files.keys().cloned().collect();
     let file_set: std::collections::HashSet<&str> = file_paths.iter().map(String::as_str).collect();
 
-    let mut new_edges: Vec<IndexEdge> = Vec::new();
+    let existing_edges = std::mem::take(&mut index.edges);
 
-    for file in &file_paths {
-        let ext = Path::new(file.as_str())
+    let (implicit_edges, csharp_edges): (Vec<IndexEdge>, Vec<IndexEdge>) = {
+        let idx: &ProjectIndex = &*index;
+        let parallel_edges: Vec<IndexEdge> = file_paths
+            .par_iter()
+            .flat_map(|file| {
+                let ext = Path::new(file.as_str())
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+
+                let mut file_edges: Vec<IndexEdge> = Vec::new();
+                match ext {
+                    "rs" => {
+                        collect_rust_mod_edges_cached(
+                            file,
+                            &file_set,
+                            idx,
+                            &mut file_edges,
+                            content_cache,
+                        );
+                    }
+                    "go" => collect_go_package_edges(file, &file_paths, &mut file_edges),
+                    "py" => collect_python_init_edges(file, &file_paths, &mut file_edges),
+                    "ts" | "js" | "tsx" | "jsx" => {
+                        collect_barrel_edges_cached(
+                            file,
+                            &file_set,
+                            idx,
+                            &mut file_edges,
+                            content_cache,
+                        );
+                    }
+                    _ => {}
+                }
+                file_edges
+            })
+            .collect();
+
+        // C# namespace cohesion is computed in a single pass over all `.cs` files
+        // (grouping needs every file), rather than per-file inside the loop above.
+        let mut cs_edges: Vec<IndexEdge> = Vec::new();
+        collect_csharp_namespace_edges(&file_paths, idx, &mut cs_edges, content_cache);
+
+        (parallel_edges, cs_edges)
+    };
+
+    // Restore the original edges and fold in the new ones.
+    index.edges = existing_edges;
+    index.edges.extend(implicit_edges);
+    index.edges.extend(csharp_edges);
+}
+
+/// Link C# files that declare the same namespace so namespace-cohesive code
+/// (including `partial` classes split across files) forms a connected component
+/// even without a direct `using`. Files in a namespace are chained
+/// deterministically (`a -> b -> c`), yielding `n-1` edges per group.
+fn collect_csharp_namespace_edges(
+    file_paths: &[String],
+    index: &ProjectIndex,
+    edges: &mut Vec<IndexEdge>,
+    content_cache: &HashMap<String, Arc<String>>,
+) {
+    let mut by_namespace: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+
+    for file in file_paths {
+        if Path::new(file.as_str())
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("");
+            != Some("cs")
+        {
+            continue;
+        }
 
-        match ext {
-            "rs" => {
-                collect_rust_mod_edges_cached(
-                    file,
-                    &file_set,
-                    index,
-                    &mut new_edges,
-                    content_cache,
-                );
+        let content = if let Some(cached) = content_cache.get(file) {
+            std::borrow::Cow::Borrowed(cached.as_str())
+        } else {
+            let full_path = Path::new(&index.project_root).join(file);
+            match std::fs::read_to_string(&full_path) {
+                Ok(c) => std::borrow::Cow::Owned(c),
+                Err(_) => continue,
             }
-            // Go same-package dependencies are now precise `type_ref` edges
-            // (GH #398 bug class); the old coarse one-edge-per-file `package`
-            // heuristic mislabelled them as top-weight `imports` in the mirror
-            // and polluted the impact blast radius, so it is gone — unused
-            // orphans fall to the standard low-weight sibling rescue instead.
-            "py" => collect_python_init_edges(file, &file_paths, &mut new_edges),
-            "ts" | "js" | "tsx" | "jsx" => {
-                collect_barrel_edges_cached(file, &file_set, index, &mut new_edges, content_cache);
-            }
-            _ => {}
+        };
+
+        if let Some(namespace) = csharp_primary_namespace(&content) {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .push(file.clone());
         }
     }
 
-    index.edges.extend(new_edges);
+    for (_namespace, mut files) in by_namespace {
+        files.sort();
+        files.dedup();
+        if files.len() < 2 {
+            continue;
+        }
+        for pair in files.windows(2) {
+            edges.push(IndexEdge {
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                kind: "namespace".to_string(),
+                weight: 0.6,
+            });
+        }
+    }
+}
+
+/// First namespace declared in a C# file — block `namespace X.Y { }` or
+/// file-scoped `namespace X.Y;`. Comment lines are skipped so a commented-out
+/// declaration is never mistaken for the real one.
+fn csharp_primary_namespace(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("namespace ") {
+            let namespace: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '{' && *c != ';')
+                .collect();
+            if !namespace.is_empty() {
+                return Some(namespace);
+            }
+        }
+    }
+    None
 }
 
 fn collect_rust_mod_edges_cached(
@@ -268,7 +386,7 @@ fn collect_rust_mod_edges_cached(
     file_set: &std::collections::HashSet<&str>,
     index: &ProjectIndex,
     edges: &mut Vec<IndexEdge>,
-    content_cache: &HashMap<String, String>,
+    content_cache: &HashMap<String, Arc<String>>,
 ) {
     if !index.files.contains_key(file) {
         return;
@@ -365,7 +483,7 @@ fn collect_barrel_edges_cached(
     file_set: &std::collections::HashSet<&str>,
     index: &ProjectIndex,
     edges: &mut Vec<IndexEdge>,
-    content_cache: &HashMap<String, String>,
+    content_cache: &HashMap<String, Arc<String>>,
 ) {
     let basename = Path::new(file)
         .file_stem()
@@ -534,54 +652,58 @@ fn build_cochange_edges(index: &mut ProjectIndex, git: Option<std::process::Chil
 // ---------------------------------------------------------------------------
 
 fn build_sibling_edges(index: &mut ProjectIndex) {
-    let connected: std::collections::HashSet<&str> = index
-        .edges
+    let existing_edges = std::mem::take(&mut index.edges);
+    let connected: std::collections::HashSet<&str> = existing_edges
         .iter()
         .flat_map(|e| [e.from.as_str(), e.to.as_str()])
         .collect();
 
     let file_paths: Vec<String> = index.files.keys().cloned().collect();
-    let mut new_edges: Vec<IndexEdge> = Vec::new();
 
-    for file in &file_paths {
-        if connected.contains(file.as_str()) {
-            continue;
-        }
-
-        let ext = Path::new(file.as_str())
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let dir = Path::new(file.as_str())
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // Find one sibling with same extension
-        for other in &file_paths {
-            if other == file {
-                continue;
+    // Each isolate (file not yet connected) searches for a sibling independently.
+    let sibling_edges: Vec<IndexEdge> = file_paths
+        .par_iter()
+        .filter_map(|file| {
+            if connected.contains(file.as_str()) {
+                return None;
             }
-            let other_ext = Path::new(other.as_str())
+
+            let ext = Path::new(file.as_str())
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
-            let other_dir = Path::new(other.as_str())
+            let dir = Path::new(file.as_str())
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            if other_ext == ext && other_dir == dir {
-                new_edges.push(IndexEdge {
-                    from: file.clone(),
-                    to: other.clone(),
-                    kind: "sibling".to_string(),
-                    weight: 0.2,
-                });
-                break; // Max 1 sibling edge per isolate
-            }
-        }
-    }
+            // Find one sibling with same extension
+            for other in &file_paths {
+                if other == file {
+                    continue;
+                }
+                let other_ext = Path::new(other.as_str())
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let other_dir = Path::new(other.as_str())
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
 
-    index.edges.extend(new_edges);
+                if other_ext == ext && other_dir == dir {
+                    return Some(IndexEdge {
+                        from: file.clone(),
+                        to: other.clone(),
+                        kind: "sibling".to_string(),
+                        weight: 0.2,
+                    });
+                }
+            }
+            None
+        })
+        .collect();
+
+    index.edges = existing_edges;
+    index.edges.extend(sibling_edges);
 }
