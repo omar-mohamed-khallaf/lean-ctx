@@ -7,10 +7,7 @@ use serde::{Deserialize, Serialize};
 mod build;
 mod chunking;
 pub use chunking::format_search_results;
-pub(crate) use chunking::{
-    tokenize, tokenize_for_index, split_camel_case_tokens, detect_symbol, find_block_end,
-    enrich_for_bm25, extract_chunks,
-};
+pub(crate) use chunking::{enrich_for_bm25, extract_chunks, tokenize, tokenize_for_index};
 mod coordinator;
 pub use coordinator::{SearchIndexBuildProgress, get_or_start_build};
 #[cfg(test)]
@@ -348,6 +345,7 @@ impl BM25Index {
     }
 
     /// Enrich and tokenize a chunk without touching the index.
+    #[allow(dead_code)]
     pub(crate) fn prepare_chunk(chunk: CodeChunk) -> (CodeChunk, Vec<String>) {
         let enriched = enrich_for_bm25(&chunk);
         let tokens = tokenize(&enriched);
