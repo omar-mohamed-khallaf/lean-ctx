@@ -114,6 +114,7 @@ pub fn disk_status_for_semantic(project_root: &str) -> DiskStatus {
     }
 }
 
+#[must_use]
 pub fn disk_status(project_root: &str) -> DiskStatusAll {
     DiskStatusAll {
         graph_index: disk_status_for_graph(project_root),
@@ -123,11 +124,13 @@ pub fn disk_status(project_root: &str) -> DiskStatusAll {
     }
 }
 
+#[must_use]
 pub fn status_json(project_root: &str) -> String {
     serde_json::to_string(&disk_status(project_root)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Returns `true` if any process currently holds the index-pipeline lock.
+#[must_use]
 pub fn is_building() -> bool {
     let Ok(data_dir) = crate::core::data_dir::lean_ctx_data_dir() else {
         return false;

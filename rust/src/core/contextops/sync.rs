@@ -9,14 +9,7 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
-/// (Re)write the canonical lean-ctx rules block into every detected agent config.
-///
-/// The source of truth is `rules_canonical` (via `rules_inject::inject_all_rules`),
-/// **not** `.lean-ctx/rules.toml`. Sync regenerates the canonical block and
-/// preserves the user's own text around the `<!-- lean-ctx-rules -->` markers;
-/// `rules.toml` is consumed only by `lint` and produced by `init` (see
-/// [`super::config::RulesConfig`]). Stating this explicitly resolves the
-/// "sync doesn't honor rules.toml" ambiguity — by design it does not (#548).
+#[must_use]
 pub fn sync_all(home: &Path) -> SyncReport {
     let inject_result = crate::rules_inject::inject_all_rules(home);
 
@@ -31,10 +24,7 @@ pub fn sync_all(home: &Path) -> SyncReport {
     }
 }
 
-/// (Re)write the canonical rules block into a single agent's config.
-///
-/// Same canonical-source contract as [`sync_all`]: regenerates from
-/// `rules_canonical` and never reads `.lean-ctx/rules.toml` (#548).
+#[must_use]
 pub fn sync_agent(home: &Path, agent: &str) -> SyncReport {
     let inject_result = crate::rules_inject::inject_rules_for_agent(home, agent);
 

@@ -33,16 +33,8 @@ pub struct DriftReport {
     pub diff: Option<String>,
 }
 
-/// Compare each detected agent's on-disk `<!-- lean-ctx-rules -->` block against
-/// the **canonical** rule source (`rules_canonical` via
-/// `rules_inject::rules_shared_content` / `rules_dedicated_markdown`).
-///
-/// Drift is measured purely against the canonical single-source-of-truth — it
-/// deliberately does **not** read `.lean-ctx/rules.toml`. `rules.toml` is a
-/// `rules lint` input and a user-facing export from `rules init`; it never
-/// overrides the canonical rule body (see [`super::config::RulesConfig`]). This
-/// is also why `rules diff` works without running `rules init` first (#548).
-pub fn detect_drift(home: &Path) -> Vec<DriftReport> {
+#[must_use]
+pub fn detect_drift(home: &Path, _config: &RulesConfig) -> Vec<DriftReport> {
     let statuses = crate::rules_inject::collect_rules_status(home);
     // The canonical block lean-ctx would write for each target, keyed by name and
     // chosen by the target's real `RulesFormat` — see the heuristic note below.

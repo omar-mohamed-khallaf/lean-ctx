@@ -2,6 +2,7 @@ use crate::core::archive;
 use crate::core::context_handles::HandleRegistry;
 use crate::core::context_ledger::ContextLedger;
 
+#[must_use]
 pub fn handle(args: &serde_json::Value) -> String {
     let action = args
         .get("action")
@@ -17,6 +18,7 @@ pub fn handle(args: &serde_json::Value) -> String {
 
 /// Try to resolve a handle reference (@F1, @K1, etc.) to a file path.
 /// Returns None if the ID is not a handle reference.
+#[must_use]
 pub fn resolve_handle_ref(id: &str) -> Option<String> {
     let clean = id.strip_prefix('@').unwrap_or(id);
     if clean.len() < 2 {
@@ -165,7 +167,7 @@ fn dispatch_selectors(id: &str, content: &str, noun: &str, args: &serde_json::Va
 }
 
 /// Surgical retrieval over a CCR proxy tee file (#482). Mirrors the archive
-/// selectors (head / tail / search / json_path / range / full) but operates on
+/// selectors (head / tail / search / `json_path` / range / full) but operates on
 /// the verbatim tee content on disk, so the agent pulls back only the slice it
 /// needs rather than undoing the proxy's compression with a full re-inject.
 fn expand_tee_file(path: &std::path::Path, args: &serde_json::Value) -> String {

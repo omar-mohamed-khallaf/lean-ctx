@@ -205,6 +205,7 @@ fn print_shell_write_error(rc_path: &std::path::Path, source_line: &str, err: &s
     eprintln!();
 }
 
+#[must_use]
 pub fn generate_hook_powershell(binary: &str) -> String {
     let config = crate::core::config::Config::load();
     let activation = config.shell_activation_effective();
@@ -288,6 +289,7 @@ pub fn init_powershell(binary: &str) {
     }
 }
 
+#[must_use]
 pub fn remove_lean_ctx_block_ps(content: &str) -> String {
     let mut result = String::new();
     let mut in_block = false;
@@ -316,6 +318,7 @@ pub fn remove_lean_ctx_block_ps(content: &str) -> String {
     result
 }
 
+#[must_use]
 pub fn generate_hook_fish(binary: &str) -> String {
     let config = crate::core::config::Config::load();
     let activation = config.shell_activation_effective();
@@ -462,6 +465,7 @@ pub fn init_fish(binary: &str) {
     }
 }
 
+#[must_use]
 pub fn generate_hook_posix(binary: &str) -> String {
     let config = crate::core::config::Config::load();
     let activation = config.shell_activation_effective();
@@ -784,6 +788,7 @@ fn print_docker_env_hints(is_zsh: bool) {
     eprintln!();
 }
 
+#[must_use]
 pub fn remove_lean_ctx_block(content: &str) -> String {
     if content.contains("# lean-ctx shell hook — end") {
         return remove_lean_ctx_block_by_marker(content);

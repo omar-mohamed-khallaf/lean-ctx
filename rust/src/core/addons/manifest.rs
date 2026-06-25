@@ -104,6 +104,7 @@ impl AddonManifest {
     }
 
     /// Human name for display (falls back to the slug).
+    #[must_use]
     pub fn display_name(&self) -> &str {
         if self.addon.display_name.trim().is_empty() {
             &self.addon.name
@@ -132,6 +133,7 @@ impl AddonManifest {
     }
 
     /// The gateway server entry this addon installs.
+    #[must_use]
     pub fn to_gateway_server(&self) -> GatewayServer {
         GatewayServer {
             name: self.addon.name.clone(),
@@ -150,6 +152,7 @@ impl AddonManifest {
     /// True when the addon declares a runnable MCP endpoint (one-click
     /// installable). A registry entry without a valid `[mcp]` block is *listed*
     /// only and reports `false` here.
+    #[must_use]
     pub fn is_installable(&self) -> bool {
         self.to_gateway_server().resolve().is_ok()
     }

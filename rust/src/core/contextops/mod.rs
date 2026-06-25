@@ -16,6 +16,7 @@ pub struct ContextOps {
 }
 
 impl ContextOps {
+    #[must_use]
     pub fn new(home: &Path, project_root: &Path) -> Self {
         Self {
             home: home.to_path_buf(),
@@ -32,10 +33,12 @@ impl ContextOps {
         drift::detect_drift(&self.home)
     }
 
+    #[must_use]
     pub fn sync_all(&self) -> SyncReport {
         sync::sync_all(&self.home)
     }
 
+    #[must_use]
     pub fn sync_agent(&self, agent: &str) -> SyncReport {
         sync::sync_agent(&self.home, agent)
     }
@@ -45,6 +48,7 @@ impl ContextOps {
         Ok(lint::lint(&config, &self.home))
     }
 
+    #[must_use]
     pub fn status(&self) -> Vec<crate::rules_inject::RulesTargetStatus> {
         crate::rules_inject::collect_rules_status(&self.home)
     }
@@ -53,11 +57,13 @@ impl ContextOps {
         RulesConfig::init_from_existing(&self.project_root, &self.home)
     }
 
+    #[must_use]
     pub fn has_config(&self) -> bool {
         RulesConfig::config_path(&self.project_root).exists()
     }
 }
 
+#[must_use]
 pub fn format_status(statuses: &[crate::rules_inject::RulesTargetStatus]) -> String {
     let mut lines = Vec::new();
     lines.push("Agent Rules Status:".to_string());
@@ -78,6 +84,7 @@ pub fn format_status(statuses: &[crate::rules_inject::RulesTargetStatus]) -> Str
     lines.join("\n")
 }
 
+#[must_use]
 pub fn format_drift(reports: &[DriftReport]) -> String {
     let mut lines = Vec::new();
     lines.push("Drift Report:".to_string());
@@ -102,6 +109,7 @@ pub fn format_drift(reports: &[DriftReport]) -> String {
     lines.join("\n")
 }
 
+#[must_use]
 pub fn format_lint(warnings: &[LintWarning]) -> String {
     if warnings.is_empty() {
         return "No lint issues found.".to_string();
@@ -128,6 +136,7 @@ pub fn format_lint(warnings: &[LintWarning]) -> String {
     lines.join("\n")
 }
 
+#[must_use]
 pub fn format_sync(report: &SyncReport) -> String {
     let mut lines = Vec::new();
     lines.push("Sync Report:".to_string());

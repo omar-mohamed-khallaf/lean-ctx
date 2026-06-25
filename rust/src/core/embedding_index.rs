@@ -71,6 +71,7 @@ pub enum EmbeddingBuildOutcome {
 }
 
 impl EmbeddingBuildOutcome {
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -80,6 +81,7 @@ impl EmbeddingBuildOutcome {
         }
     }
 
+    #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::ModelNotAvailable(r) => Some(r.as_str()),
@@ -228,6 +230,7 @@ pub fn build_or_update(root: &Path, bm25: &super::chunk_data::ChunkData) -> Embe
 const CURRENT_VERSION: u32 = 3;
 
 impl EmbeddingIndex {
+    #[must_use]
     pub fn new(dimensions: usize) -> Self {
         Self {
             version: CURRENT_VERSION,
@@ -239,6 +242,7 @@ impl EmbeddingIndex {
     }
 
     /// Create a new index tagged with a specific model identity.
+    #[must_use]
     pub fn new_with_model(dimensions: usize, model_id: &str) -> Self {
         Self {
             version: CURRENT_VERSION,
@@ -251,6 +255,7 @@ impl EmbeddingIndex {
 
     /// Check if the index was built with a different model than currently selected.
     /// Returns `Some((stored_model, current_model))` on mismatch, `None` if compatible.
+    #[must_use]
     pub fn model_mismatch<'a>(&'a self, current_model: &'a str) -> Option<(&'a str, &'a str)> {
         match &self.model_id {
             Some(stored) if stored != current_model => Some((stored, current_model)),
@@ -259,11 +264,13 @@ impl EmbeddingIndex {
     }
 
     /// Check if index dimensions are incompatible with the current engine.
+    #[must_use]
     pub fn dimension_mismatch(&self, engine_dimensions: usize) -> bool {
         self.dimensions != engine_dimensions && !self.entries.is_empty()
     }
 
     /// Approximate heap memory used by this index in bytes.
+    #[must_use]
     pub fn memory_usage_bytes(&self) -> usize {
         let entries_size: usize = self
             .entries
@@ -297,6 +304,7 @@ impl EmbeddingIndex {
     }
 
     /// Load a previously saved index, or create a new empty one.
+    #[must_use]
     pub fn load_or_new(root: &Path, dimensions: usize) -> Self {
         Self::load(root).unwrap_or_else(|| Self::new(dimensions))
     }
@@ -305,6 +313,7 @@ impl EmbeddingIndex {
     ///
     /// When the index is empty (no prior embeddings), skips hash computation
     /// entirely by returning all unique file paths from chunks directly.
+    #[must_use]
     pub fn files_needing_update(&self, chunks: &[CodeChunk]) -> Vec<String> {
         // Empty index: every file needs embedding — skip O(chunks) hash iteration.
         if self.file_hashes.is_empty() {
@@ -399,9 +408,10 @@ impl EmbeddingIndex {
     /// single contiguous [`FlatEmbeddings`] allocation. Returns None if the index
     /// doesn't cover all chunks.
     ///
-    /// The flat layout (_n_vectors × _dim_ in row-major order) gives sequential
+    /// The flat layout (_`n_vectors` × _dim_ in row-major order) gives sequential
     /// memory access during dot-product scoring — one dereference instead of the
     /// two-level indirection of `Arc<[Vec<f32>]>`.
+    #[must_use]
     pub fn get_aligned_flat(&self, chunks: &[CodeChunk]) -> Option<FlatEmbeddings> {
         let dim = self.dimensions;
         let mut map: HashMap<(&str, usize, usize), &EmbeddingEntry> =
@@ -422,6 +432,7 @@ impl EmbeddingIndex {
         })
     }
 
+    #[must_use]
     pub fn coverage(&self, total_chunks: usize) -> f64 {
         if total_chunks == 0 {
             return 0.0;
