@@ -1779,7 +1779,10 @@ mod tests {
             .expect("impact analysis");
 
         assert!(
-            impact.affected_files.iter().any(|e| e.file_path == "core/motor.go"),
+            impact
+                .affected_files
+                .iter()
+                .any(|e| e.file_path == "core/motor.go"),
             "same-package consumer (no import) must be affected; got: {:?}",
             impact.affected_files
         );

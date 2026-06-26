@@ -7,46 +7,19 @@
 //! lean-ctx already has the building blocks as separate tools; this composes
 //! them into one response for a natural-language task:
 //!   1. extracted keywords,
-//!   2. semantically ranked files (BM25 / hybrid),
-//!   3. exact match locations (index-backed `ctx_search`),
-//!   4. the body of the most relevant symbol, inline.
+//!   2. hybrid-search ranked files (index built on demand),
+//!   3. associative (graph spreading activation).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::core::graph_provider;
+use crate::core::config::{Config, IndexingMode};
+
+use crate::core::index_pipeline::pipeline::IndexPipeline;
 use crate::core::tokens::count_tokens;
 use crate::tools::CrpMode;
-
-/// Wall-time budget for the semantic-ranking stage. The exact-match and symbol
-/// stages are index-backed and cheap; only semantic ranking can hit a cold
-/// `O(corpus)` BM25 build. We never let that block the agent loop: past the
-/// budget we return what we have and let the detached worker finish warming the
-/// resident cache for the next call. Override via `LEAN_CTX_COMPOSE_BUDGET_MS`.
-const DEFAULT_SEMANTIC_BUDGET_MS: u64 = 2500;
-
-fn semantic_budget() -> Duration {
-    let ms = std::env::var("LEAN_CTX_COMPOSE_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_SEMANTIC_BUDGET_MS);
-    Duration::from_millis(ms)
-}
-
-/// Token budget for the inlined symbol bodies. Submodular selection fills it
-/// with the most coverage-effective, non-redundant set of symbols.
-/// Override via `LEAN_CTX_COMPOSE_SYMBOL_TOKENS`.
-const DEFAULT_SYMBOL_BUDGET_TOKENS: usize = 600;
-
-fn symbol_budget_tokens() -> usize {
-    std::env::var("LEAN_CTX_COMPOSE_SYMBOL_TOKENS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_SYMBOL_BUDGET_TOKENS)
-}
 
 /// Wall-time budget for the associative (graph spreading-activation) stage.
 /// Opening/building the graph index is `O(corpus)` on a cold repo, so — like
@@ -77,17 +50,39 @@ const SPREAD_TOP_K: usize = 8;
 /// string when no graph/seeds are available. Runs entirely in the worker thread
 /// so [`associative_block_budgeted`] can bound it.
 fn build_associative_block(project_root: &str, keywords: &[String]) -> String {
-    let Some(open) = graph_provider::open_or_build(project_root) else {
+    use rusqlite::params;
+
+    let root = Path::new(project_root);
+    let db_path = crate::core::index_namespace::vectors_dir(root).join("code_index.db");
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
         return String::new();
     };
-    let gp = &open.provider;
 
-    // Seeds: distinct files the keywords resolve to via symbol lookup.
+    // Seeds: find files whose symbols match any keyword via FTS5.
     let mut seed_files: Vec<String> = Vec::new();
     for kw in keywords {
-        for sym in gp.find_symbols(kw, None, None) {
-            if !seed_files.contains(&sym.file) {
-                seed_files.push(sym.file);
+        let tokens: Vec<String> = kw
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\"{t}\""))
+            .collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let fts_query = tokens.join(" AND ");
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT n.file_path \
+             FROM nodes_fts f \
+             JOIN nodes n ON n.id = f.rowid \
+             WHERE nodes_fts MATCH ?1 \
+             LIMIT 20",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![fts_query], |row| row.get::<_, String>(0)) {
+                for row in rows.flatten() {
+                    if !seed_files.contains(&row) {
+                        seed_files.push(row);
+                    }
+                }
             }
         }
     }
@@ -95,12 +90,9 @@ fn build_associative_block(project_root: &str, keywords: &[String]) -> String {
         return String::new();
     }
 
-    // Hebbian update: files relevant to the same task "fire together", so record
-    // their co-access (strengthens future associative recall). Persisted.
     crate::core::cooccurrence::record_access(project_root, &seed_files);
 
-    // Adjacency = static structural edges ∪ learned co-access edges. Edges are
-    // made bidirectional so activation spreads both up and down the graph.
+    // Adjacency from edges table (source → target file pairs).
     let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     let mut add_edge = |a: &str, b: &str, w: f64| {
         adjacency
@@ -112,9 +104,21 @@ fn build_associative_block(project_root: &str, keywords: &[String]) -> String {
             .or_default()
             .push((a.to_string(), w));
     };
-    for e in gp.edges() {
-        add_edge(&e.from, &e.to, if e.weight > 0.0 { e.weight } else { 1.0 });
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT n1.file_path, n2.file_path \
+         FROM edges e \
+         JOIN nodes n1 ON n1.id = e.source_id \
+         JOIN nodes n2 ON n2.id = e.target_id",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                add_edge(&row.0, &row.1, 1.0);
+            }
+        }
     }
+
     let coaccess = crate::core::cooccurrence::load(project_root);
     for sf in &seed_files {
         for (nbr, w) in coaccess.related(sf, 16) {
@@ -136,8 +140,6 @@ fn build_associative_block(project_root: &str, keywords: &[String]) -> String {
 
     let mut s = String::from("\n## Related (associative: import/call graph + learned co-access)\n");
     for (file, activation) in ranked {
-        // Forward-slash normalize so Windows backslash paths are never escape-
-        // mangled by client render layers (issue #324).
         let file = crate::core::protocol::display_path(&file);
         s.push_str(&format!("- {file} (activation {activation:.2})\n"));
     }
@@ -244,79 +246,37 @@ fn extract_keywords(task: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// Run the semantic ranking stage under a wall-time budget. Returns the ranked
-/// block on time, or a short "deferred" note if the (cold) build overruns.
-fn ranked_files_budgeted(task: &str, project_root: &str, crp_mode: CrpMode) -> String {
-    let (tx, rx) = mpsc::channel::<String>();
-    let task_owned = task.to_string();
-    let root_owned = project_root.to_string();
-
-    std::thread::spawn(move || {
-        let ranked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::tools::ctx_semantic_search::handle_impl(
-                &task_owned,
-                &root_owned,
-                8,
-                crp_mode,
-                None,
-                None,
-                None,
-                Some(false),
-                Some(false),
-            )
-        }))
-        .unwrap_or_else(|_| {
-            tracing::warn!("[ctx_compose: semantic ranking panicked; omitting section]");
-            String::new()
-        });
-        // Receiver may be gone (we timed out); dropping the result is fine —
-        // the cache warming already happened as a side effect of the build.
-        let _ = tx.send(ranked);
-    });
-
-    match rx.recv_timeout(semantic_budget()) {
-        Ok(ranked) => ranked.trim().to_string(),
-        Err(_) => deferred_ranking_note(project_root),
+/// Build the index synchronously the first time `ctx_compose` is called for a
+/// project. One-time ~12s on a cold repo; incremental builds thereafter.
+fn ensure_index_sync(project_root: &str) {
+    let root = Path::new(project_root);
+    let db_path = crate::core::index_namespace::vectors_dir(root).join("code_index.db");
+    if db_path.exists() {
+        return;
     }
-}
-
-/// Honest, state-aware note when semantic ranking overruns its wall-time budget.
-///
-/// The old message always promised ranking would be "instant on the next call".
-/// That is a lie when the index build *failed* or the index is too large to
-/// persist — in those cases every call rebuilds and the promise never comes
-/// true (issue #249: "keeps saying it's warming up … but it never happens").
-/// We now read the real orchestrator state and tell the agent exactly what is
-/// happening and what to do about it.
-fn deferred_ranking_note(project_root: &str) -> String {
-    let exact = "the exact matches below are authoritative for this call";
-    // Check if the code_index.db exists with chunks — if so the index is ready.
-    let db_path = crate::core::index_namespace::vectors_dir(std::path::Path::new(project_root))
-        .join("code_index.db");
-    let has_chunks = db_path.exists()
-        && rusqlite::Connection::open(&db_path)
-            .ok()
-            .and_then(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))
-                    .ok()
-            })
-            .unwrap_or(0)
-            > 0;
-    if has_chunks {
-        format!(
-            "(deferred — semantic index is warming; {exact}, \
-             and ranking will be fast on the next call once the index is cached)"
-        )
-    } else {
-        format!(
-            "(deferred — semantic index is warming; {exact}, \
-             and ranking becomes available once the index is built)"
-        )
+    tracing::info!(
+        "[ctx_compose] code_index.db not found — building index for {project_root} \
+         (one-time ~12s; incremental after)"
+    );
+    let mode = IndexingMode::effective(&Config::load());
+    match IndexPipeline::new(root.to_path_buf())
+        .with_mode(mode)
+        .build()
+    {
+        Ok(pipeline) => {
+            if let Err(e) = pipeline.run() {
+                tracing::warn!("[ctx_compose] index build failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[ctx_compose] index pipeline setup failed: {e}");
+        }
     }
 }
 
 /// Compose a single rich response for `task`.
 #[must_use]
+#[allow(unused_variables)]
 pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usize) {
     let task = task.trim();
     if task.is_empty() {
@@ -324,7 +284,6 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
     }
 
     let keywords = extract_keywords(task, 6);
-    let allow_secret = crate::core::roles::active_role().io.allow_secret_paths;
 
     let mut out = String::new();
     out.push_str(&format!("TASK: {task}\n"));
@@ -334,78 +293,33 @@ pub fn handle(task: &str, project_root: &str, crp_mode: CrpMode) -> (String, usi
         out.push_str(&format!("KEYWORDS: {}\n", keywords.join(", ")));
     }
 
-    // 1. Semantically ranked files for the whole task — budgeted so a cold
-    //    BM25 build can never stall the agent loop (hardening H1). The worker
-    //    inherits the resident cache, so a build that overruns the budget still
-    //    warms the cache for the next call rather than being wasted.
-    out.push_str("\n## Ranked files (semantic)\n");
-    out.push_str(&ranked_files_budgeted(task, project_root, crp_mode));
-    out.push('\n');
+    // Ensure index exists — build synchronously if missing (one-time ~12s cost).
+    // After this, all searches hit a warm index.
+    ensure_index_sync(project_root);
 
-    // 2. Exact match locations for the primary keyword (index-backed search).
-    if let Some(primary) = keywords.first() {
-        let grep = crate::tools::ctx_search::handle(
-            primary,
-            project_root,
-            None,
-            10,
-            crp_mode,
-            true,
-            allow_secret,
-        )
-        .text;
-        out.push_str(&format!("\n## Exact matches: '{primary}'\n"));
-        out.push_str(grep.trim());
-        out.push('\n');
-    }
-
-    // 3. Inline the symbol bodies that best cover the task keywords. Rather
-    //    than just the first match, select the non-redundant *set* of symbols
-    //    with maximal keyword coverage under a token budget via submodular
-    //    greedy (1−1/e optimal). Two keywords resolving to the same symbol, or
-    //    a symbol whose body adds no new keyword, are naturally pruned.
-    use crate::core::context_packing::{CoverageItem, greedy_max_coverage};
-    let mut snippets: Vec<String> = Vec::new();
-    let mut items: Vec<CoverageItem> = Vec::new();
-    for kw in &keywords {
-        if let Some((rendered, toks)) =
-            crate::tools::ctx_symbol::best_symbol_snippet(kw, project_root)
-        {
-            // The snippet always covers its triggering keyword, plus any other
-            // task keyword its body textually surfaces (a more central symbol).
-            let mut terms: std::collections::HashSet<String> =
-                std::collections::HashSet::from([kw.clone()]);
-            for other in &keywords {
-                if other != kw && rendered.contains(other.as_str()) {
-                    terms.insert(other.clone());
+    // 1. Hybrid search on the full task — BM25 + dense vectors.
+    out.push_str("\n## Ranked files\n");
+    if let Ok(results) =
+        crate::tools::ctx_semantic_search::search_hits(task, project_root, 20, "hybrid", None, None)
+    {
+        for r in &results {
+            let score = format!("{:.1}", r.rrf_score);
+            out.push_str(&format!(
+                "  {}:{}  {}  ({})\n",
+                r.file_path, r.start_line, r.symbol_name, score
+            ));
+            // First line of snippet for context
+            if let Some(first_line) = r.snippet.lines().next() {
+                let trimmed = first_line.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("    {trimmed}\n"));
                 }
             }
-            items.push(CoverageItem {
-                terms,
-                cost: toks.max(1),
-            });
-            snippets.push(rendered);
         }
     }
-    if !items.is_empty() {
-        let chosen = greedy_max_coverage(&items, symbol_budget_tokens(), |_| 1.0);
-        let mut seen = std::collections::HashSet::new();
-        let mut header_written = false;
-        for idx in chosen {
-            let rendered = snippets[idx].trim();
-            if rendered.is_empty() || !seen.insert(rendered.to_string()) {
-                continue;
-            }
-            if !header_written {
-                out.push_str("\n## Top symbols (bodies)\n");
-                header_written = true;
-            }
-            out.push_str(rendered);
-            out.push('\n');
-        }
-    }
+    out.push('\n');
 
-    // 4. Associative neighbours via spreading activation over the import/call
+    // 2. Associative neighbours via spreading activation over the import/call
     //    graph unified with the learned Hebbian co-access graph (budgeted,
     //    additive — surfaces structurally-close files lexical search misses).
     out.push_str(&associative_block_budgeted(project_root, &keywords));
@@ -439,26 +353,5 @@ mod tests {
         let (out, tok) = handle("   ", "/tmp", CrpMode::Off);
         assert!(out.starts_with("ERROR"));
         assert_eq!(tok, 0);
-    }
-
-    #[test]
-    fn deferred_note_for_idle_index_is_optimistic_but_honest() {
-        // Unknown project → orchestrator state is idle. The note must NOT promise
-        // "instant on the next call" (the dishonest wording from #249); it should
-        // explain the index is warming and will be fast once cached.
-        let tmp = tempfile::tempdir().unwrap();
-        let note = deferred_ranking_note(tmp.path().to_string_lossy().as_ref());
-        assert!(
-            note.contains("warming") || note.contains("building"),
-            "note: {note}"
-        );
-        assert!(
-            note.contains("authoritative"),
-            "note must reassure that exact matches are authoritative: {note}"
-        );
-        assert!(
-            !note.contains("instant on the next call"),
-            "must not repeat the dishonest 'instant next call' promise: {note}"
-        );
     }
 }

@@ -61,7 +61,6 @@ pub mod ctx_shell;
 pub mod ctx_skillify;
 pub mod ctx_smells;
 pub mod ctx_summary;
-pub mod ctx_symbol;
 pub mod ctx_task;
 pub mod ctx_tools;
 pub mod ctx_transcript_compact;
